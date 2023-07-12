@@ -78,6 +78,7 @@ bool sysbus_has_irq(SysBusDevice *dev, int n);
 bool sysbus_has_mmio(SysBusDevice *dev, unsigned int n);
 void sysbus_connect_irq(SysBusDevice *dev, int n, qemu_irq irq);
 bool sysbus_is_irq_connected(SysBusDevice *dev, int n);
+int sysbus_get_num_connected_irqs(SysBusDevice *dev);
 qemu_irq sysbus_get_connected_irq(SysBusDevice *dev, int n);
 void sysbus_mmio_map(SysBusDevice *dev, int n, hwaddr addr);
 void sysbus_mmio_map_overlap(SysBusDevice *dev, int n, hwaddr addr,

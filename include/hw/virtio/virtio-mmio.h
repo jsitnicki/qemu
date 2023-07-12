@@ -57,7 +57,6 @@ struct VirtIOMMIOProxy {
     /* Generic */
     SysBusDevice parent_obj;
     MemoryRegion iomem;
-    qemu_irq irq;
     bool legacy;
     uint32_t flags;
     /* Guest accessible state needing migration and reset */
@@ -70,6 +69,15 @@ struct VirtIOMMIOProxy {
     /* Fields only used for non-legacy (v2) devices */
     uint32_t guest_features[2];
     VirtIOMMIOQueue vqs[VIRTIO_QUEUE_MAX];
+
+    /* TODO: Move device class properties to class struct */
+    uint32_t nvectors_len;
+    uint32_t *nvectors;
+
+    uint32_t irq_len;
+    qemu_irq *irq;
+    int *vec_irq_map;
+    int irq_base;
 };
 
 #endif

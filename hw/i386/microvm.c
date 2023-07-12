@@ -162,6 +162,7 @@ static void microvm_devices_init(MicrovmMachineState *mms)
     X86MachineState *x86ms = X86_MACHINE(mms);
     ISABus *isa_bus;
     GSIState *gsi_state;
+    int virtio_irqs;
     int ioapics;
     int i;
 
@@ -182,22 +183,53 @@ static void microvm_devices_init(MicrovmMachineState *mms)
 
     kvmclock_create(true);
 
-    mms->virtio_irq_base = 5;
-    mms->virtio_num_transports = 8;
     if (x86ms->ioapic2) {
         mms->pcie_irq_base = 16;    /* 16 -> 19 */
         /* use second ioapic (24 -> 47) for virtio-mmio irq lines */
         mms->virtio_irq_base = IO_APIC_SECONDARY_IRQBASE;
-        mms->virtio_num_transports = IOAPIC_NUM_PINS;
+        virtio_irqs = IOAPIC_NUM_PINS;
     } else if (x86_machine_is_acpi_enabled(x86ms)) {
         mms->pcie_irq_base = 12;    /* 12 -> 15 */
         mms->virtio_irq_base = 16;  /* 16 -> 23 */
+        virtio_irqs = 8;
+    } else {
+        mms->virtio_irq_base = 1; /* 1 -> 12 */
+        virtio_irqs = 12;
     }
 
-    for (i = 0; i < mms->virtio_num_transports; i++) {
-        sysbus_create_simple("virtio-mmio",
-                             VIRTIO_MMIO_BASE + i * 512,
-                             x86ms->gsi[mms->virtio_irq_base + i]);
+    for (i = 0; virtio_irqs > 0; i++) {
+        DeviceState *dev = qdev_new(TYPE_VIRTIO_MMIO);
+        VirtIOMMIOProxy *proxy = VIRTIO_MMIO(dev);
+        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+        int dev_irqs;
+        int j;
+
+        /* Override the number of IRQ vectors for this transport? */
+        if (i < proxy->nvectors_len && proxy->nvectors[i] > 0) {
+            dev_irqs = proxy->nvectors[i];
+        } else {
+            dev_irqs = 1;
+        }
+
+        if (virtio_irqs < dev_irqs) {
+            error_report("Not enough IRQs for virtio-mmio device: want=%d left=%d",
+                         dev_irqs, virtio_irqs);
+            exit(1);
+        }
+        virtio_irqs -= dev_irqs;
+
+        /* After realize parent bus holds a ref so we release ours */
+        proxy->irq_len = dev_irqs;
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        sysbus_mmio_map(sbd, 0, VIRTIO_MMIO_BASE + i * 512);
+
+        /* Connect IRQs */
+        proxy->irq_base = mms->virtio_irq_base;
+        for (j = 0; j < dev_irqs; j++) {
+            qemu_irq irq = x86ms->gsi[mms->virtio_irq_base];
+            sysbus_connect_irq(sbd, j, irq);
+            mms->virtio_irq_base++;
+        }
     }
 
     /* Optional and legacy devices */
@@ -341,7 +373,7 @@ static void microvm_memory_init(MicrovmMachineState *mms)
     x86ms->ioapic_as = &address_space_memory;
 }
 
-static gchar *microvm_get_mmio_cmdline(gchar *name, uint32_t virtio_irq_base)
+static gchar *microvm_get_mmio_cmdline(gchar *name, int irq_first, int irq_last)
 {
     gchar *cmdline;
     gchar *separator;
@@ -359,9 +391,9 @@ static gchar *microvm_get_mmio_cmdline(gchar *name, uint32_t virtio_irq_base)
 
     cmdline = g_malloc0(VIRTIO_CMDLINE_MAXLEN);
     ret = g_snprintf(cmdline, VIRTIO_CMDLINE_MAXLEN,
-                     " virtio_mmio.device=512@0x%lx:%ld",
+                     " virtio_mmio.device=512@0x%lx:%d-%d",
                      VIRTIO_MMIO_BASE + index * 512,
-                     virtio_irq_base + index);
+                     irq_first, irq_last);
     if (ret < 0 || ret >= VIRTIO_CMDLINE_MAXLEN) {
         g_free(cmdline);
         return NULL;
@@ -373,7 +405,6 @@ static gchar *microvm_get_mmio_cmdline(gchar *name, uint32_t virtio_irq_base)
 static void microvm_fix_kernel_cmdline(MachineState *machine)
 {
     X86MachineState *x86ms = X86_MACHINE(machine);
-    MicrovmMachineState *mms = MICROVM_MACHINE(machine);
     BusState *bus;
     BusChild *kid;
     char *cmdline;
@@ -387,7 +418,7 @@ static void microvm_fix_kernel_cmdline(MachineState *machine)
      */
     cmdline = g_strdup(machine->kernel_cmdline);
     bus = sysbus_get_default();
-    QTAILQ_FOREACH(kid, &bus->children, sibling) {
+    QTAILQ_FOREACH_REVERSE(kid, &bus->children, sibling) {
         DeviceState *dev = kid->child;
 
         if (object_dynamic_cast(OBJECT(dev), TYPE_VIRTIO_MMIO)) {
@@ -395,9 +426,13 @@ static void microvm_fix_kernel_cmdline(MachineState *machine)
             VirtioBusState *mmio_virtio_bus = &mmio->bus;
             BusState *mmio_bus = &mmio_virtio_bus->parent_obj;
 
+            qemu_irq irq_base = sysbus_get_connected_irq(SYS_BUS_DEVICE(mmio), 0);
+            int irq_first = qemu_irq_get_num(irq_base);
+            int irq_last = irq_first + mmio->irq_len - 1;
+
             if (!QTAILQ_EMPTY(&mmio_bus->children)) {
-                gchar *mmio_cmdline = microvm_get_mmio_cmdline
-                    (mmio_bus->name, mms->virtio_irq_base);
+                gchar *mmio_cmdline = microvm_get_mmio_cmdline(mmio_bus->name,
+                                                               irq_first, irq_last);
                 if (mmio_cmdline) {
                     char *newcmd = g_strjoin(NULL, cmdline, mmio_cmdline, NULL);
                     g_free(mmio_cmdline);

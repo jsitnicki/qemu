@@ -68,11 +68,16 @@ static void virtio_mmio_stop_ioeventfd(VirtIOMMIOProxy *proxy)
     virtio_bus_stop_ioeventfd(&proxy->bus);
 }
 
+static void virtio_mmio_device_plugged(DeviceState *d, Error **errp);
+
 static void virtio_mmio_soft_reset(VirtIOMMIOProxy *proxy)
 {
     int i;
 
     virtio_bus_reset(&proxy->bus);
+
+    /* HACK: We need to remap vectors to queues */
+    virtio_mmio_device_plugged(DEVICE(proxy), NULL);
 
     if (!proxy->legacy) {
         for (i = 0; i < VIRTIO_QUEUE_MAX; i++) {
@@ -532,14 +537,25 @@ static void virtio_mmio_update_irq(DeviceState *opaque, uint16_t vector)
 {
     VirtIOMMIOProxy *proxy = VIRTIO_MMIO(opaque);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
-    int level;
+    qemu_irq irq;
+    int idx, level;
 
     if (!vdev) {
         return;
     }
+
+    if (vector == VIRTIO_NO_VECTOR) {
+        vector = 0;
+    }
+
     level = (qatomic_read(&vdev->isr) != 0);
-    trace_virtio_mmio_setting_irq(level);
-    qemu_set_irq(proxy->irq, level);
+    trace_virtio_mmio_setting_irq(level, vector);
+
+    assert(vector < proxy->irq_len);
+    idx = proxy->vec_irq_map[vector];
+    assert(idx >= 0 && idx < proxy->irq_len);
+    irq = proxy->irq[idx];
+    qemu_set_irq(irq, level);
 }
 
 static int virtio_mmio_load_config(DeviceState *opaque, QEMUFile *f)
@@ -706,6 +722,9 @@ static int virtio_mmio_set_guest_notifiers(DeviceState *d, int nvqs,
 
     nvqs = MIN(nvqs, VIRTIO_QUEUE_MAX);
 
+    /* HACK: Only vNIC uses multiple VQs */
+    with_irqfd = nvqs > 1;
+
     for (n = 0; n < nvqs; n++) {
         if (!virtio_queue_get_num(vdev, n)) {
             break;
@@ -716,9 +735,28 @@ static int virtio_mmio_set_guest_notifiers(DeviceState *d, int nvqs,
             goto assign_error;
         }
     }
-    r = virtio_mmio_set_config_guest_notifier(d, assign, with_irqfd);
+    r = virtio_mmio_set_config_guest_notifier(d, assign, false /* with_irqfd */);
     if (r < 0) {
         goto assign_error;
+    }
+
+    /* Assign KVM irqfds */
+    if (assign && with_irqfd) {
+        for (n = 0; n < nvqs; n++) {
+            if (!virtio_queue_get_num(vdev, n)) {
+                break;
+            }
+
+            VirtQueue *vq = virtio_get_queue(vdev, n);
+            EventNotifier *gn = virtio_queue_get_guest_notifier(vq);
+            int gsi = proxy->irq_base + virtio_queue_vector(vdev, n);
+
+            r = kvm_irqchip_add_irqfd_notifier_gsi(kvm_state, gn, NULL, gsi);
+            if (r < 0) {
+                /* FIXME: Release KVM irqfds */
+                assert(false);
+            }
+        }
     }
 
     return 0;
@@ -750,6 +788,9 @@ static Property virtio_mmio_properties[] = {
     DEFINE_PROP_BOOL("force-legacy", VirtIOMMIOProxy, legacy, true),
     DEFINE_PROP_BIT("ioeventfd", VirtIOMMIOProxy, flags,
                     VIRTIO_IOMMIO_FLAG_USE_IOEVENTFD_BIT, true),
+    DEFINE_PROP_ARRAY("vectors", VirtIOMMIOProxy,
+                      nvectors_len, nvectors,
+                      qdev_prop_uint32, uint32_t),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -757,9 +798,17 @@ static void virtio_mmio_realizefn(DeviceState *d, Error **errp)
 {
     VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
     SysBusDevice *sbd = SYS_BUS_DEVICE(d);
+    int i;
 
     qbus_init(&proxy->bus, sizeof(proxy->bus), TYPE_VIRTIO_MMIO_BUS, d, NULL);
-    sysbus_init_irq(sbd, &proxy->irq);
+
+    proxy->irq = g_malloc_n(proxy->irq_len, sizeof(*proxy->irq));
+    for (i = 0; i < proxy->irq_len; i++)
+        sysbus_init_irq(sbd, &proxy->irq[i]);
+
+    proxy->vec_irq_map = g_malloc_n(proxy->irq_len, sizeof(*proxy->vec_irq_map));
+    for (i = 0; i < proxy->irq_len; i++)
+        proxy->vec_irq_map[i] = -1;
 
     if (!kvm_eventfds_enabled()) {
         proxy->flags &= ~VIRTIO_IOMMIO_FLAG_USE_IOEVENTFD;
@@ -782,20 +831,47 @@ static void virtio_mmio_realizefn(DeviceState *d, Error **errp)
     sysbus_init_mmio(sbd, &proxy->iomem);
 }
 
+static void virtio_mmio_irq_connected(SysBusDevice *sbd, qemu_irq irq)
+{
+    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(DEVICE(sbd));
+    int i, vec;
+
+    for (i = 0; i < proxy->irq_len; i++) {
+        if (proxy->irq[i] != irq)
+            continue;
+
+        vec = qemu_irq_get_num(irq) - proxy->irq_base;
+        proxy->vec_irq_map[vec] = i;
+
+        break;
+    }
+}
+
+static void virtio_mmio_fini(Object *obj)
+{
+    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(obj);
+    g_free(proxy->nvectors);
+    g_free(proxy->irq);
+    g_free(proxy->vec_irq_map);
+}
+
 static void virtio_mmio_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    SysBusDeviceClass *sbd_class = SYS_BUS_DEVICE_CLASS(klass);
 
     dc->realize = virtio_mmio_realizefn;
     dc->reset = virtio_mmio_reset;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
     device_class_set_props(dc, virtio_mmio_properties);
+    sbd_class->connect_irq_notifier = virtio_mmio_irq_connected;
 }
 
 static const TypeInfo virtio_mmio_info = {
     .name          = TYPE_VIRTIO_MMIO,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(VirtIOMMIOProxy),
+    .instance_finalize = virtio_mmio_fini,
     .class_init    = virtio_mmio_class_init,
 };
 
@@ -853,6 +929,33 @@ static void virtio_mmio_vmstate_change(DeviceState *d, bool running)
     }
 }
 
+static void virtio_mmio_device_plugged(DeviceState *d, Error **errp)
+{
+    VirtIOMMIOProxy *proxy = VIRTIO_MMIO(d);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(proxy);
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    int num_queues;
+    int num_vectors;
+    uint16_t vector;
+    int i;
+
+    if (!vdev) {
+        return;
+    }
+
+    if (vdev->nvectors > 0) {
+        num_queues = virtio_get_num_queues(vdev);
+        num_vectors = sysbus_get_num_connected_irqs(sbd);
+
+        vector = 0;
+        for (i = 0; i < num_queues; i++) {
+            virtio_queue_set_vector(vdev, i, vector);
+            if (i % 2)
+                vector = (vector + 1) % num_vectors;
+        }
+    }
+}
+
 static void virtio_mmio_bus_class_init(ObjectClass *klass, void *data)
 {
     BusClass *bus_class = BUS_CLASS(klass);
@@ -869,6 +972,7 @@ static void virtio_mmio_bus_class_init(ObjectClass *klass, void *data)
     k->ioeventfd_assign = virtio_mmio_ioeventfd_assign;
     k->pre_plugged = virtio_mmio_pre_plugged;
     k->vmstate_change = virtio_mmio_vmstate_change;
+    k->device_plugged = virtio_mmio_device_plugged;
     k->has_variable_vring_alignment = true;
     bus_class->max_dev = 1;
     bus_class->get_dev_path = virtio_mmio_bus_get_dev_path;

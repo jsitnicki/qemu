@@ -94,7 +94,6 @@ struct MicrovmMachineState {
     /* Machine state */
     uint32_t pcie_irq_base;
     uint32_t virtio_irq_base;
-    uint32_t virtio_num_transports;
     bool kernel_cmdline_fixed;
     Notifier machine_done;
     Notifier powerdown_req;

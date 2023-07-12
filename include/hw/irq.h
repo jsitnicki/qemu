@@ -68,4 +68,6 @@ static inline bool qemu_irq_is_connected(qemu_irq irq)
     return irq != NULL;
 }
 
+int qemu_irq_get_num(qemu_irq irq);
+
 #endif

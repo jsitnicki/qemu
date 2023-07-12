@@ -98,7 +98,7 @@ virtio_mmio_read(uint64_t offset) "virtio_mmio_read offset 0x%" PRIx64
 virtio_mmio_write_offset(uint64_t offset, uint64_t value) "virtio_mmio_write offset 0x%" PRIx64 " value 0x%" PRIx64
 virtio_mmio_guest_page(uint64_t size, int shift) "guest page size 0x%" PRIx64 " shift %d"
 virtio_mmio_queue_write(uint64_t value, int max_size) "mmio_queue write 0x%" PRIx64 " max %d"
-virtio_mmio_setting_irq(int level) "virtio_mmio setting IRQ %d"
+virtio_mmio_setting_irq(int level, uint16_t vector) "virtio_mmio setting IRQ %d vector=%" PRIu16
 
 # virtio-pci.c
 virtio_pci_notify(uint16_t vector) "virtio_pci_notify vec 0x%x"

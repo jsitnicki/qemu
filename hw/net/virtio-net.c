@@ -3654,6 +3654,8 @@ static void virtio_net_device_realize(DeviceState *dev, Error **errp)
         }
     }
     n->max_queue_pairs = MAX(n->max_queue_pairs, 1);
+    /* FIXME: Signal that we want one IRQs per datapath VQ */
+    vdev->nvectors = n->max_queue_pairs;
 
     if (n->max_queue_pairs * 2 + 1 > VIRTIO_QUEUE_MAX) {
         error_setg(errp, "Invalid number of queue pairs (= %" PRIu32 "), "

@@ -104,6 +104,19 @@ bool sysbus_is_irq_connected(SysBusDevice *dev, int n)
     return !!sysbus_get_connected_irq(dev, n);
 }
 
+int sysbus_get_num_connected_irqs(SysBusDevice *dev)
+{
+    int i;
+
+    /* FIXME: We need a constant for max IRQs */
+    for (i = 0; i < 48; i++) {
+        if (!sysbus_is_irq_connected(dev, i))
+            break;
+    }
+
+    return i;
+}
+
 qemu_irq sysbus_get_connected_irq(SysBusDevice *dev, int n)
 {
     DeviceState *d = DEVICE(dev);
